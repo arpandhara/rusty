@@ -7,7 +7,7 @@ use std::path::Path;
 use crate::merge::MergeState;
 use crate::tree::write_tree;
 
-#[derive(Deserialize, Serialize, Debug, Clone)]
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub tree: String,
     pub message: String,

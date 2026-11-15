@@ -143,6 +143,19 @@ pub fn validate_object_hash(hash: &str) -> Result<()> {
 pub fn safe_join(repo_root: &Path, rel: &str) -> Result<PathBuf> {
     validate_rel_path(rel)?;
 
+    // Repository metadata is never a valid worktree destination, even when the
+    // path is lexically inside the root. This prevents a hostile tree object
+    // from replacing `.rusty/index` or `.git/config`.
+    if rel
+        .split('/')
+        .any(|component| component == ".rusty" || component == ".git")
+    {
+        bail!(
+            "unsafe path \"{}\": targets repository metadata (.rusty or .git)",
+            rel
+        );
+    }
+
     let canonical_root = repo_root
         .canonicalize()
         .ok()
@@ -303,6 +316,8 @@ mod tests {
         assert!(safe_join(&root, "src/../../../pwned.txt").is_err());
         assert!(safe_join(&root, "C:pwned.txt").is_err());
         assert!(safe_join(&root, "").is_err());
+        assert!(safe_join(&root, ".rusty/index").is_err());
+        assert!(safe_join(&root, "nested/.git/config").is_err());
     }
 
     #[test]

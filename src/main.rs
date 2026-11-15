@@ -17,7 +17,9 @@ mod pull;
 mod push;
 mod remote;
 mod repository;
+mod reset;
 mod rm;
+mod state;
 mod status;
 mod tree;
 mod tui;
@@ -226,6 +228,57 @@ fn main() -> Result<()> {
             if !report.is_clean {
                 std::process::exit(1);
             }
+        }
+        Commands::Reset {
+            target,
+            move_ref,
+            index,
+            worktree,
+            soft,
+            mixed,
+            hard,
+            dry_run,
+            json,
+            yes,
+            paths,
+        } => {
+            let alias_count = (soft as u8) + (mixed as u8) + (hard as u8);
+            let explicit_count = (move_ref as u8) + (index as u8) + (worktree as u8);
+
+            if alias_count > 1 {
+                anyhow::bail!("Cannot combine multiple compatibility aliases (--soft, --mixed, --hard)");
+            }
+            if alias_count > 0 && explicit_count > 0 {
+                anyhow::bail!(
+                    "Cannot combine compatibility aliases (--soft, --mixed, --hard) with explicit flags (--move-ref, --index, --worktree)"
+                );
+            }
+
+            let (final_move_ref, final_index, final_worktree) = if soft {
+                (true, false, false)
+            } else if mixed {
+                (true, true, false)
+            } else if hard {
+                (true, true, true)
+            } else {
+                (move_ref, index, worktree)
+            };
+
+            let repo = state::Repository::discover()?;
+            let request = reset::ResetRequest {
+                target,
+                destinations: reset::ResetDestinations {
+                    move_ref: final_move_ref,
+                    index: final_index,
+                    worktree: final_worktree,
+                },
+                paths,
+                dry_run,
+                json,
+                yes,
+            };
+
+            reset::run_reset(&repo, &request)?;
         }
     }
 
