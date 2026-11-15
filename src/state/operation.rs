@@ -13,6 +13,10 @@ use crate::state::index::{
     write_bytes_atomic,
 };
 use crate::state::repository::Repository;
+use crate::state::refs::{
+    ensure_commit_object, recovery_record_path, restore_original_ref, update_ref_to,
+    write_recovery_record, ResetRecoveryRecord, RESET_RECOVERY_SCHEMA_VERSION,
+};
 use crate::state::worktree::{
     inspect_path, list_files_under, remove_stale_temp_file, remove_worktree_path,
     restore_empty_directory, restore_file, write_blob_to_worktree, PathState,
@@ -61,6 +65,16 @@ pub struct IndexBackup {
     pub checksum: Option<String>,
 }
 
+/// Backup of the previous `.rusty/refs/recover/last-reset` bytes, so a
+/// rolled-back ref-moving reset does not leave a recovery pointer describing a
+/// move that was undone.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RecoveryBackup {
+    pub existed: bool,
+    pub backup_path: Option<String>,
+    pub checksum: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OriginalRefState {
     pub head_commit: Option<String>,
@@ -77,6 +91,8 @@ pub struct OperationJournal {
     pub plan: ResetPlan,
     pub original_ref: OriginalRefState,
     pub index: IndexBackup,
+    #[serde(default)]
+    pub recovery: RecoveryBackup,
     pub backups: Vec<BackupEntry>,
 }
 
@@ -346,6 +362,67 @@ pub fn restore_index(repo: &Repository, op_dir: &Path, backup: &IndexBackup) -> 
     }
 }
 
+/// Back up the previous last-reset recovery pointer, if any.
+pub fn backup_recovery_record(repo: &Repository, op_dir: &Path) -> Result<RecoveryBackup> {
+    let path = recovery_record_path(repo);
+
+    match fs::read(&path) {
+        Ok(data) => {
+            let rel_backup = "backups/last-reset".to_string();
+            write_bytes_atomic(&op_dir.join(&rel_backup), &data)?;
+            Ok(RecoveryBackup {
+                existed: true,
+                backup_path: Some(rel_backup),
+                checksum: checksum_bytes(Some(&data)),
+            })
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(RecoveryBackup::default()),
+        Err(e) => Err(e)
+            .with_context(|| format!("Failed to back up recovery pointer '{}'", path.display())),
+    }
+}
+
+/// Restore (or remove) the last-reset recovery pointer from an operation
+/// backup.
+pub fn restore_recovery_backup(
+    repo: &Repository,
+    op_dir: &Path,
+    backup: &RecoveryBackup,
+) -> Result<()> {
+    let path = recovery_record_path(repo);
+
+    if backup.existed {
+        let rel = backup
+            .backup_path
+            .as_deref()
+            .context("Recovery pointer backup is marked as existing but has no backup path")?;
+        let data = fs::read(op_dir.join(rel)).with_context(|| {
+            format!(
+                "Missing recovery pointer backup '{}' needed for rollback",
+                op_dir.join(rel).display()
+            )
+        })?;
+        verify_checksum(&data, backup.checksum.as_deref(), "recovery pointer backup")?;
+        write_bytes_atomic(&path, &data)
+    } else {
+        match fs::remove_file(&path) {
+            Ok(()) => {
+                if let Some(parent) = path.parent() {
+                    fsync_dir_best_effort(parent);
+                }
+                Ok(())
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).with_context(|| {
+                format!(
+                    "Failed to remove recovery pointer '{}' during rollback",
+                    path.display()
+                )
+            }),
+        }
+    }
+}
+
 /// Restore one worktree path to the state captured in `entry`.
 pub fn restore_original(repo: &Repository, op_dir: &Path, entry: &BackupEntry) -> Result<()> {
     match entry.kind {
@@ -508,7 +585,13 @@ pub fn finalize_journal(
     status: &str,
     recovered: bool,
 ) -> Result<()> {
-    append_ledger(repo, &ledger_record_from_journal(journal, status, recovered))?;
+    // A terminal record is written at most once per operation. If a crash
+    // happened after the ledger append but before the journal was removed,
+    // recovery must not add a second, contradictory terminal record.
+    let terminal = matches!(status, "completed" | "rolled_back" | "rolled_forward");
+    if !terminal || !ledger_has_terminal_status(repo, &journal.operation_id)? {
+        append_ledger(repo, &ledger_record_from_journal(journal, status, recovered))?;
+    }
 
     let active = active_journal_path(repo);
     match fs::remove_file(&active) {
@@ -629,6 +712,15 @@ fn rollback(repo: &Repository, op_dir: &Path, journal: &OperationJournal) -> Res
         restore_index(repo, op_dir, &journal.index)?;
     }
 
+    if journal.plan.destinations.move_ref {
+        restore_original_ref(
+            repo,
+            journal.original_ref.symbolic_ref.as_deref(),
+            journal.original_ref.head_commit.as_deref(),
+        )?;
+        restore_recovery_backup(repo, op_dir, &journal.recovery)?;
+    }
+
     Ok(())
 }
 
@@ -640,6 +732,67 @@ fn roll_forward(repo: &Repository, op_dir: &Path, journal: &OperationJournal) ->
         save_index_atomic(&index, &repo.rusty_dir)?;
     }
 
+    if journal.plan.destinations.move_ref {
+        let update = journal
+            .plan
+            .ref_update
+            .as_ref()
+            .context("Committed ref-moving operation has no ref update")?;
+
+        // Do not write a no-op recovery record over the previous meaningful
+        // reset. The ref is already at the target.
+        if update.from_commit.as_deref() != Some(update.to_commit.as_str()) {
+            ensure_commit_object(repo, &update.to_commit)?;
+
+            // The recovery pointer is written before the ref, exactly as in the
+            // forward path, so the record and the ref cannot disagree.
+            let record = recovery_record_from_journal(journal)
+                .context("Committed ref-moving operation has no recovery record")?;
+            write_recovery_record(repo, &record)?;
+            update_ref_to(repo, update.target_ref.as_deref(), &update.to_commit)?;
+        }
+
+        if journal.plan.is_full_reset() {
+            clear_merge_state(repo)?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Build the recovery pointer for a ref-moving journal.
+pub fn recovery_record_from_journal(
+    journal: &OperationJournal,
+) -> Option<ResetRecoveryRecord> {
+    let update = journal.plan.ref_update.as_ref()?;
+    Some(ResetRecoveryRecord {
+        schema_version: RESET_RECOVERY_SCHEMA_VERSION,
+        operation_id: journal.operation_id.clone(),
+        timestamp_unix_ms: journal.created_at_unix_ms,
+        ref_name: update.target_ref.clone(),
+        from_commit: update.from_commit.clone(),
+        to_commit: update.to_commit.clone(),
+    })
+}
+
+/// Remove merge state after a full reset has aborted a merge.
+///
+/// This is deliberately called only after the `Committed` marker, so a
+/// pre-commit rollback leaves the merge exactly as it was.
+pub fn clear_merge_state(repo: &Repository) -> Result<()> {
+    for name in ["MERGE_HEAD", "MERGE_STATE", "MERGE_MSG"] {
+        let path = repo.rusty_dir.join(name);
+        match fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(e).with_context(|| {
+                    format!("Failed to clear merge state '{}'", path.display())
+                })
+            }
+        }
+    }
+    fsync_dir_best_effort(&repo.rusty_dir);
     Ok(())
 }
 
@@ -688,35 +841,61 @@ pub fn ledger_record_from_journal(
     }
 }
 
-pub fn ledger_contains(repo: &Repository, operation_id: &str) -> Result<bool> {
+fn ledger_records(repo: &Repository) -> Result<Vec<serde_json::Value>> {
     let path = ledger_path(repo);
     let content = match fs::read_to_string(&path) {
         Ok(content) => content,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(e) => {
             return Err(e)
                 .with_context(|| format!("Failed to read ledger '{}'", path.display()))
         }
     };
 
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(value) = serde_json::from_str::<serde_json::Value>(line)
-            && value.get("operation_id").and_then(|v| v.as_str()) == Some(operation_id)
-        {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
+    Ok(content
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .collect())
 }
 
-/// Append a completed/recovered record to the operation ledger. Appending is
-/// idempotent per operation id, so replaying recovery never duplicates a line.
+#[cfg(test)]
+pub fn ledger_contains(repo: &Repository, operation_id: &str) -> Result<bool> {
+    Ok(ledger_records(repo)?.iter().any(|value| {
+        value.get("operation_id").and_then(|v| v.as_str()) == Some(operation_id)
+    }))
+}
+
+/// True when the ledger already contains a record for this operation with the
+/// given status.
+pub fn ledger_contains_status(
+    repo: &Repository,
+    operation_id: &str,
+    status: &str,
+) -> Result<bool> {
+    Ok(ledger_records(repo)?.iter().any(|value| {
+        value.get("operation_id").and_then(|v| v.as_str()) == Some(operation_id)
+            && value.get("status").and_then(|v| v.as_str()) == Some(status)
+    }))
+}
+
+/// True when the ledger already contains a terminal record for this operation.
+fn ledger_has_terminal_status(repo: &Repository, operation_id: &str) -> Result<bool> {
+    Ok(ledger_records(repo)?.iter().any(|value| {
+        value.get("operation_id").and_then(|v| v.as_str()) == Some(operation_id)
+            && matches!(
+                value.get("status").and_then(|v| v.as_str()),
+                Some("completed" | "rolled_back" | "rolled_forward")
+            )
+    }))
+}
+
+/// Append a record to the operation ledger. Appending is idempotent per
+/// `(operation_id, status)`, so replaying recovery never duplicates a line
+/// while the pre-ref `ref_update_pending` record and the final record can
+/// coexist.
 pub fn append_ledger(repo: &Repository, record: &LedgerRecord) -> Result<()> {
-    if ledger_contains(repo, &record.operation_id)? {
+    if ledger_contains_status(repo, &record.operation_id, &record.status)? {
         return Ok(());
     }
 
@@ -859,6 +1038,14 @@ pub fn prepare_journal(
         }
     };
 
+    // Back up the previous recovery pointer before it can be overwritten by
+    // this operation, so a pre-commit rollback restores the old pointer too.
+    let recovery = if plan.destinations.move_ref {
+        backup_recovery_record(repo, &op_dir)?
+    } else {
+        RecoveryBackup::default()
+    };
+
     let mut backups = Vec::new();
     if plan.destinations.worktree {
         for change in &plan.worktree_changes {
@@ -878,6 +1065,7 @@ pub fn prepare_journal(
             symbolic_ref: repo.current_symbolic_ref()?,
         },
         index,
+        recovery,
         backups,
     })
 }
@@ -887,6 +1075,7 @@ mod tests {
     use super::*;
     use crate::commit::Commit;
     use crate::reset::plan::{ChangeKind, IndexUpdatePlan, RefUpdatePlan, WorktreeChange};
+    use crate::state::refs::{read_recovery_record, read_ref_value, write_recovery_record};
     use crate::tree::{Tree, TreeEntry};
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -1177,6 +1366,126 @@ mod tests {
             restored.entries.get("file.txt").unwrap().blob_hash,
             fixture.old_blob
         );
+    }
+
+    #[test]
+    fn roll_forward_writes_recovery_pointer_and_moves_ref() {
+        let fixture = fixture();
+        let old_commit = crate::commit::get_commit(&fixture.repo.rusty_dir, &fixture.new_commit)
+            .unwrap()
+            .parents[0]
+            .clone();
+
+        let mut plan = plan_for(&fixture, false, false);
+        plan.operation_id = "op-ref-forward".to_string();
+        plan.target_commit = old_commit.clone();
+        plan.destinations.move_ref = true;
+        plan.ref_update = Some(RefUpdatePlan {
+            target_ref: Some("refs/heads/main".to_string()),
+            from_commit: Some(fixture.new_commit.clone()),
+            to_commit: old_commit.clone(),
+        });
+
+        let mut journal = prepare_journal(&fixture.repo, &plan, vec![]).unwrap();
+        journal.phase = OperationPhase::Committed;
+        write_journal(&fixture.repo, &journal).unwrap();
+
+        let outcome = recover_if_needed(&fixture.repo).unwrap().unwrap();
+        assert_eq!(outcome, RecoveryOutcome::RolledForward);
+
+        assert_eq!(
+            read_ref_value(&fixture.repo, "refs/heads/main").unwrap(),
+            Some(old_commit.clone())
+        );
+        let record = read_recovery_record(&fixture.repo).unwrap().unwrap();
+        assert_eq!(record.operation_id, "op-ref-forward");
+        assert_eq!(record.from_commit.as_deref(), Some(fixture.new_commit.as_str()));
+        assert_eq!(record.to_commit, old_commit);
+        assert!(!active_journal_path(&fixture.repo).exists());
+    }
+
+    #[test]
+    fn rollback_restores_ref_and_previous_recovery_pointer() {
+        let fixture = fixture();
+        let old_commit = crate::commit::get_commit(&fixture.repo.rusty_dir, &fixture.new_commit)
+            .unwrap()
+            .parents[0]
+            .clone();
+
+        let previous = ResetRecoveryRecord {
+            schema_version: RESET_RECOVERY_SCHEMA_VERSION,
+            operation_id: "previous-op".to_string(),
+            timestamp_unix_ms: 1,
+            ref_name: Some("refs/heads/main".to_string()),
+            from_commit: Some(old_commit.clone()),
+            to_commit: fixture.new_commit.clone(),
+        };
+        write_recovery_record(&fixture.repo, &previous).unwrap();
+
+        let mut plan = plan_for(&fixture, false, false);
+        plan.operation_id = "op-ref-rollback".to_string();
+        plan.target_commit = old_commit.clone();
+        plan.destinations.move_ref = true;
+        plan.ref_update = Some(RefUpdatePlan {
+            target_ref: Some("refs/heads/main".to_string()),
+            from_commit: Some(fixture.new_commit.clone()),
+            to_commit: old_commit.clone(),
+        });
+
+        let journal = prepare_journal(&fixture.repo, &plan, vec![]).unwrap();
+        write_journal(&fixture.repo, &journal).unwrap();
+
+        // Simulate a crash after the recovery pointer and ref were written but
+        // before the commit marker.
+        let record = recovery_record_from_journal(&journal).unwrap();
+        write_recovery_record(&fixture.repo, &record).unwrap();
+        update_ref_to(&fixture.repo, Some("refs/heads/main"), &old_commit).unwrap();
+
+        let outcome = recover_if_needed(&fixture.repo).unwrap().unwrap();
+        assert_eq!(outcome, RecoveryOutcome::RolledBack);
+
+        assert_eq!(
+            read_ref_value(&fixture.repo, "refs/heads/main").unwrap(),
+            Some(fixture.new_commit.clone())
+        );
+        assert_eq!(read_recovery_record(&fixture.repo).unwrap(), Some(previous));
+        assert!(!active_journal_path(&fixture.repo).exists());
+    }
+
+    #[test]
+    fn pending_and_terminal_ledger_records_coexist() {
+        let fixture = fixture();
+        let plan = plan_for(&fixture, false, false);
+        let journal = prepare_journal(&fixture.repo, &plan, vec![]).unwrap();
+
+        let pending = ledger_record_from_journal(&journal, "ref_update_pending", false);
+        let completed = ledger_record_from_journal(&journal, "completed", false);
+
+        append_ledger(&fixture.repo, &pending).unwrap();
+        append_ledger(&fixture.repo, &completed).unwrap();
+        // Replaying either record must not duplicate it.
+        append_ledger(&fixture.repo, &pending).unwrap();
+        append_ledger(&fixture.repo, &completed).unwrap();
+
+        let content = fs::read_to_string(ledger_path(&fixture.repo)).unwrap();
+        assert_eq!(content.lines().count(), 2);
+    }
+
+    #[test]
+    fn finalize_does_not_add_a_second_terminal_record() {
+        let fixture = fixture();
+        let plan = plan_for(&fixture, false, false);
+        let journal = prepare_journal(&fixture.repo, &plan, vec![]).unwrap();
+        write_journal(&fixture.repo, &journal).unwrap();
+
+        let completed = ledger_record_from_journal(&journal, "completed", false);
+        append_ledger(&fixture.repo, &completed).unwrap();
+
+        finalize_journal(&fixture.repo, &journal, "rolled_forward", true).unwrap();
+
+        let content = fs::read_to_string(ledger_path(&fixture.repo)).unwrap();
+        assert_eq!(content.lines().count(), 1);
+        assert!(!content.contains("rolled_forward"));
     }
 
     #[test]

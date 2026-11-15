@@ -5,6 +5,7 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use crate::index::Index;
 use crate::merge;
 use crate::path_check::{validate_object_hash, validate_rel_path};
+use crate::state::refs::validate_branch_ref;
 use crate::state::repository::Repository;
 use crate::state::revision::resolve_revision;
 use crate::state::worktree::{inspect_path, list_files_under, PathState};
@@ -81,6 +82,15 @@ impl ResetPlan {
         !self.conflicts.iter().any(|c| c.fatal)
     }
 
+    /// A full reset moves the ref and replaces both the index and the whole
+    /// worktree. It is the only form allowed to abort an in-progress merge.
+    pub fn is_full_reset(&self) -> bool {
+        self.destinations.move_ref
+            && self.destinations.index
+            && self.destinations.worktree
+            && self.filtered_paths.is_none()
+    }
+
     /// True when at least one selected destination would actually change.
     pub fn has_mutations(&self) -> bool {
         if self
@@ -99,7 +109,8 @@ impl ResetPlan {
             return true;
         }
 
-        // Ref movement is a mutation, even though this phase cannot execute it.
+        // Ref movement is a mutation when the target differs from the current
+        // value. An unborn ref has no current value.
         self.ref_update
             .as_ref()
             .map(|update| update.from_commit.as_deref() != Some(update.to_commit.as_str()))
@@ -462,11 +473,37 @@ pub fn create_plan(repo: &Repository, request: &ResetRequest) -> Result<ResetPla
 
     // ── Ref update plan ────────────────────────────────────────────────
     let ref_update = if request.destinations.move_ref {
-        Some(RefUpdatePlan {
+        let update = RefUpdatePlan {
             target_ref: current_ref,
             from_commit: current_head_commit.clone(),
             to_commit: target.commit_id.clone(),
-        })
+        };
+
+        if update.to_commit == "<unborn>" {
+            conflicts.push(SafetyConflict {
+                path: None,
+                message: "Cannot move a ref to an unborn target".to_string(),
+                fatal: true,
+            });
+        } else if let Err(e) = validate_object_hash(&update.to_commit) {
+            conflicts.push(SafetyConflict {
+                path: None,
+                message: format!("Ref update target is not a valid commit hash: {}", e),
+                fatal: true,
+            });
+        }
+
+        if let Some(ref_name) = &update.target_ref
+            && let Err(e) = validate_branch_ref(ref_name)
+        {
+            conflicts.push(SafetyConflict {
+                path: Some(ref_name.clone()),
+                message: format!("Cannot move ref: {}", e),
+                fatal: true,
+            });
+        }
+
+        Some(update)
     } else {
         None
     };
@@ -748,7 +785,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 static OP_COUNTER: AtomicU64 = AtomicU64::new(0);
 
-fn generate_operation_id() -> String {
+pub(crate) fn generate_operation_id() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()

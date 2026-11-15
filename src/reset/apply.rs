@@ -3,9 +3,11 @@ use anyhow::{bail, Context, Result};
 use crate::reset::plan::{ChangeKind, ResetPlan};
 use crate::state::index::save_index_atomic;
 use crate::state::operation::{
-    abort_journal, build_planned_index, cleanup_orphan_operation_dirs, finalize_journal,
-    prepare_journal, write_journal, OperationJournal, OperationPhase,
+    abort_journal, append_ledger, build_planned_index, cleanup_orphan_operation_dirs,
+    clear_merge_state, finalize_journal, ledger_record_from_journal, prepare_journal,
+    recovery_record_from_journal, write_journal, OperationJournal, OperationPhase,
 };
+use crate::state::refs::{ensure_commit_object, update_ref_to, write_recovery_record};
 use crate::state::repository::Repository;
 use crate::state::worktree::{blob_path, inspect_path, list_files_under, PathState};
 
@@ -14,14 +16,7 @@ use crate::state::worktree::{blob_path, inspect_path, list_files_under, PathStat
 /// The caller must hold the repository lock. The plan was produced under that
 /// same lock and is never recomputed here.
 pub fn apply_plan(repo: &Repository, plan: &ResetPlan, command_args: Vec<String>) -> Result<()> {
-    if plan.destinations.move_ref {
-        bail!(
-            "Ref movement is not enabled yet (Phase 4). \
-             Re-run with '--dry-run' to inspect the ref update, or omit '--move-ref'."
-        );
-    }
-
-    if !plan.destinations.index && !plan.destinations.worktree {
+    if !plan.destinations.move_ref && !plan.destinations.index && !plan.destinations.worktree {
         bail!("No executable destination selected");
     }
 
@@ -80,11 +75,28 @@ pub fn apply_plan(repo: &Repository, plan: &ResetPlan, command_args: Vec<String>
         }
     }
 
+    if plan.destinations.move_ref
+        && let Err(e) = apply_ref_update(repo, &journal)
+    {
+        return fail_with_rollback(repo, &journal, e);
+    }
+
     // Commit point: every selected destination is durable. From here on,
     // recovery rolls forward instead of rolling back.
     journal.phase = OperationPhase::Committed;
     if let Err(e) = write_journal(repo, &journal) {
         return fail_with_rollback(repo, &journal, e.context("Failed to mark operation committed"));
+    }
+
+    // Aborting an in-progress merge is only legal for a full reset. This runs
+    // after the commit point so a pre-commit failure leaves merge state intact.
+    if plan.is_full_reset()
+        && let Err(e) = clear_merge_state(repo)
+    {
+        return Err(e.context(
+            "Reset was applied, but clearing merge state failed. \
+             The next rusty invocation will complete recovery.",
+        ));
     }
 
     if let Err(e) = finalize_journal(repo, &journal, "completed", false) {
@@ -98,6 +110,42 @@ pub fn apply_plan(repo: &Repository, plan: &ResetPlan, command_args: Vec<String>
     }
 
     print_summary(plan);
+    Ok(())
+}
+
+/// Write the recovery pointer, record the pending ref update, and move the ref.
+///
+/// The recovery pointer is durable before the ref changes, so a crash between
+/// the two leaves a record that `rusty recover reset` can use. The ref itself
+/// is replaced atomically.
+fn apply_ref_update(repo: &Repository, journal: &OperationJournal) -> Result<()> {
+    let update = journal
+        .plan
+        .ref_update
+        .as_ref()
+        .context("Ref-moving plan has no ref update")?;
+
+    // A combined reset can select ref movement while targeting the current
+    // commit. There is nothing to recover in that case, and writing a no-op
+    // record would hide the previous meaningful reset from `recover reset`.
+    if update.from_commit.as_deref() == Some(update.to_commit.as_str()) {
+        return Ok(());
+    }
+
+    ensure_commit_object(repo, &update.to_commit)?;
+
+    // Record intent before touching the ref. This line is not terminal; the
+    // final completed/rolled_back record is appended by finalize_journal.
+    let pending = ledger_record_from_journal(journal, "ref_update_pending", false);
+    append_ledger(repo, &pending).context("Failed to record pending ref update")?;
+
+    let record =
+        recovery_record_from_journal(journal).context("Ref-moving plan has no recovery record")?;
+    write_recovery_record(repo, &record).context("Failed to write reset recovery pointer")?;
+
+    update_ref_to(repo, update.target_ref.as_deref(), &update.to_commit)
+        .context("Failed to move ref")?;
+
     Ok(())
 }
 
@@ -122,6 +170,10 @@ fn fail_with_rollback(
 /// target blobs are readable, before the journal is written or any file is
 /// touched.
 fn preflight(repo: &Repository, plan: &ResetPlan) -> Result<()> {
+    if plan.destinations.move_ref {
+        preflight_ref(repo, plan)?;
+    }
+
     for change in &plan.worktree_changes {
         let current = inspect_path(&repo.root, &change.path)
             .with_context(|| format!("Failed to inspect '{}' before reset", change.path))?;
@@ -202,6 +254,48 @@ fn preflight(repo: &Repository, plan: &ResetPlan) -> Result<()> {
     Ok(())
 }
 
+/// Verify that HEAD still has the shape and value the plan observed.
+fn preflight_ref(repo: &Repository, plan: &ResetPlan) -> Result<()> {
+    let update = plan
+        .ref_update
+        .as_ref()
+        .context("Ref-moving plan has no ref update")?;
+
+    ensure_commit_object(repo, &update.to_commit)?;
+
+    let current_symbolic = repo.current_symbolic_ref()?;
+    match (&update.target_ref, &current_symbolic) {
+        (Some(expected), Some(actual)) if expected == actual => {}
+        (Some(expected), actual) => bail!(
+            "HEAD changed after the plan was made: expected '{}', found {}. \
+             Re-run reset to plan against the current HEAD.",
+            expected,
+            actual
+                .as_deref()
+                .map(|name| format!("'{}'", name))
+                .unwrap_or_else(|| "a detached HEAD".to_string())
+        ),
+        (None, None) => {}
+        (None, Some(actual)) => bail!(
+            "HEAD is now attached to '{}', but the plan expected a detached HEAD. \
+             Re-run reset to plan against the current HEAD.",
+            actual
+        ),
+    }
+
+    let current_value = repo.head_commit()?;
+    if current_value != update.from_commit {
+        bail!(
+            "Ref moved after the plan was made: expected {}, found {}. \
+             Re-run reset to plan against the current state.",
+            update.from_commit.as_deref().unwrap_or("<unborn>"),
+            current_value.as_deref().unwrap_or("<unborn>")
+        );
+    }
+
+    Ok(())
+}
+
 /// True when every file currently beneath `dir_path` is scheduled for deletion
 /// by this plan. Used for safe file/directory transitions.
 fn plan_deletes_all_contents(
@@ -222,6 +316,17 @@ fn plan_deletes_all_contents(
 }
 
 fn print_summary(plan: &ResetPlan) {
+    if let Some(update) = &plan.ref_update {
+        let label = update.target_ref.as_deref().unwrap_or("HEAD (detached)");
+        println!(
+            "Ref updated: {} -> {} ({} -> {}).",
+            label,
+            update.to_commit,
+            update.from_commit.as_deref().unwrap_or("<unborn>"),
+            update.to_commit
+        );
+    }
+
     if plan.destinations.index
         && let Some(update) = &plan.index_update
     {
@@ -255,6 +360,9 @@ mod tests {
     };
     use crate::repository::get_head_commit;
     use crate::state::operation::{active_journal_path, ledger_path};
+    use crate::state::refs::{
+        read_recovery_record, read_ref_value, write_detached_head, write_recovery_record,
+    };
     use crate::tree::{Tree, TreeEntry};
     use sha2::{Digest, Sha256};
     use std::fs;
@@ -266,6 +374,7 @@ mod tests {
         repo: Repository,
         old_blob: String,
         new_blob: String,
+        old_commit: String,
         new_commit: String,
     }
 
@@ -339,6 +448,7 @@ mod tests {
             _tmp: tmp,
             old_blob,
             new_blob,
+            old_commit,
             new_commit,
         }
     }
@@ -463,14 +573,176 @@ mod tests {
     }
 
     #[test]
-    fn ref_movement_is_rejected_in_this_phase() {
+    fn attached_ref_reset_moves_branch_and_writes_recovery_record() {
         let fixture = fixture();
-        let mut plan = plan(&fixture, true, false);
-        plan.destinations.move_ref = true;
+        let plan = ResetPlan {
+            operation_id: "ref-attached".to_string(),
+            target_commit: fixture.old_commit.clone(),
+            destinations: ResetDestinations {
+                move_ref: true,
+                index: false,
+                worktree: false,
+            },
+            filtered_paths: None,
+            ref_update: Some(RefUpdatePlan {
+                target_ref: Some("refs/heads/main".to_string()),
+                from_commit: Some(fixture.new_commit.clone()),
+                to_commit: fixture.old_commit.clone(),
+            }),
+            index_update: None,
+            worktree_changes: Vec::new(),
+            conflicts: Vec::new(),
+        };
         let _lock = fixture.repo.lock().unwrap();
 
+        apply_plan(&fixture.repo, &plan, vec!["reset".to_string()]).unwrap();
+
+        assert_eq!(
+            read_ref_value(&fixture.repo, "refs/heads/main").unwrap(),
+            Some(fixture.old_commit.clone())
+        );
+        let record = read_recovery_record(&fixture.repo).unwrap().unwrap();
+        assert_eq!(record.ref_name.as_deref(), Some("refs/heads/main"));
+        assert_eq!(
+            record.from_commit.as_deref(),
+            Some(fixture.new_commit.as_str())
+        );
+        assert_eq!(record.to_commit, fixture.old_commit);
+
+        let statuses: Vec<String> = fs::read_to_string(ledger_path(&fixture.repo))
+            .unwrap()
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter_map(|value| {
+                value
+                    .get("status")
+                    .and_then(|status| status.as_str())
+                    .map(str::to_string)
+            })
+            .collect();
+        assert!(statuses.contains(&"ref_update_pending".to_string()));
+        assert!(statuses.contains(&"completed".to_string()));
+        assert!(!active_journal_path(&fixture.repo).exists());
+    }
+
+    #[test]
+    fn detached_ref_reset_updates_head_file() {
+        let fixture = fixture();
+        write_detached_head(&fixture.repo, Some(&fixture.new_commit)).unwrap();
+
+        let plan = ResetPlan {
+            operation_id: "ref-detached".to_string(),
+            target_commit: fixture.old_commit.clone(),
+            destinations: ResetDestinations {
+                move_ref: true,
+                index: false,
+                worktree: false,
+            },
+            filtered_paths: None,
+            ref_update: Some(RefUpdatePlan {
+                target_ref: None,
+                from_commit: Some(fixture.new_commit.clone()),
+                to_commit: fixture.old_commit.clone(),
+            }),
+            index_update: None,
+            worktree_changes: Vec::new(),
+            conflicts: Vec::new(),
+        };
+        let _lock = fixture.repo.lock().unwrap();
+
+        apply_plan(&fixture.repo, &plan, vec![]).unwrap();
+
+        assert_eq!(
+            fixture.repo.head_commit().unwrap(),
+            Some(fixture.old_commit.clone())
+        );
+        assert_eq!(fixture.repo.current_symbolic_ref().unwrap(), None);
+        let record = read_recovery_record(&fixture.repo).unwrap().unwrap();
+        assert_eq!(record.ref_name, None);
+    }
+
+    #[test]
+    fn ref_drift_after_plan_is_rejected_without_mutation() {
+        let fixture = fixture();
+        let plan = ResetPlan {
+            operation_id: "ref-drift".to_string(),
+            target_commit: fixture.old_commit.clone(),
+            destinations: ResetDestinations {
+                move_ref: true,
+                index: false,
+                worktree: false,
+            },
+            filtered_paths: None,
+            ref_update: Some(RefUpdatePlan {
+                target_ref: Some("refs/heads/main".to_string()),
+                from_commit: Some(fixture.new_commit.clone()),
+                to_commit: fixture.old_commit.clone(),
+            }),
+            index_update: None,
+            worktree_changes: Vec::new(),
+            conflicts: Vec::new(),
+        };
+        let _lock = fixture.repo.lock().unwrap();
+
+        // Simulate another process moving the branch after planning.
+        fs::write(
+            fixture.repo.rusty_dir.join("refs/heads/main"),
+            &fixture.old_commit,
+        )
+        .unwrap();
+
         let err = apply_plan(&fixture.repo, &plan, vec![]).unwrap_err();
-        assert!(err.to_string().contains("Phase 4"));
+        assert!(err.to_string().contains("Ref moved after the plan"));
+        assert_eq!(
+            read_ref_value(&fixture.repo, "refs/heads/main").unwrap(),
+            Some(fixture.old_commit.clone())
+        );
+        assert!(!active_journal_path(&fixture.repo).exists());
+    }
+
+    #[test]
+    fn no_op_ref_update_preserves_previous_recovery_record() {
+        let fixture = fixture();
+        let previous = crate::state::refs::ResetRecoveryRecord {
+            schema_version: crate::state::refs::RESET_RECOVERY_SCHEMA_VERSION,
+            operation_id: "previous-op".to_string(),
+            timestamp_unix_ms: 1,
+            ref_name: Some("refs/heads/main".to_string()),
+            from_commit: Some(fixture.old_commit.clone()),
+            to_commit: fixture.new_commit.clone(),
+        };
+        write_recovery_record(&fixture.repo, &previous).unwrap();
+
+        let plan = ResetPlan {
+            operation_id: "ref-noop".to_string(),
+            target_commit: fixture.new_commit.clone(),
+            destinations: ResetDestinations {
+                move_ref: true,
+                index: false,
+                worktree: false,
+            },
+            filtered_paths: None,
+            ref_update: Some(RefUpdatePlan {
+                target_ref: Some("refs/heads/main".to_string()),
+                from_commit: Some(fixture.new_commit.clone()),
+                to_commit: fixture.new_commit.clone(),
+            }),
+            index_update: None,
+            worktree_changes: Vec::new(),
+            conflicts: Vec::new(),
+        };
+        let _lock = fixture.repo.lock().unwrap();
+
+        apply_plan(&fixture.repo, &plan, vec![]).unwrap();
+
+        assert_eq!(
+            read_recovery_record(&fixture.repo).unwrap(),
+            Some(previous)
+        );
+        assert_eq!(
+            read_ref_value(&fixture.repo, "refs/heads/main").unwrap(),
+            Some(fixture.new_commit.clone())
+        );
     }
 
     #[test]

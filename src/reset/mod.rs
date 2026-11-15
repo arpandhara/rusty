@@ -1,5 +1,6 @@
 pub mod apply;
 pub mod plan;
+pub mod recover;
 pub mod validate;
 
 use anyhow::{bail, Context, Result};
@@ -10,6 +11,94 @@ pub use validate::{plan_has_destructive_warnings, validate_plan, validate_reques
 
 use crate::state::operation::{cleanup_orphan_operation_dirs, recover_if_needed};
 use crate::state::Repository;
+
+/// A Git-compatible reset alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResetAlias {
+    Soft,
+    Mixed,
+    Hard,
+}
+
+impl ResetAlias {
+    pub fn flag(self) -> &'static str {
+        match self {
+            ResetAlias::Soft => "--soft",
+            ResetAlias::Mixed => "--mixed",
+            ResetAlias::Hard => "--hard",
+        }
+    }
+
+    pub fn git_equivalent(self) -> &'static str {
+        match self {
+            ResetAlias::Soft => "git reset --soft",
+            ResetAlias::Mixed => "git reset --mixed",
+            ResetAlias::Hard => "git reset --hard",
+        }
+    }
+
+    pub fn destinations(self) -> ResetDestinations {
+        match self {
+            ResetAlias::Soft => ResetDestinations {
+                move_ref: true,
+                index: false,
+                worktree: false,
+            },
+            ResetAlias::Mixed => ResetDestinations {
+                move_ref: true,
+                index: true,
+                worktree: false,
+            },
+            ResetAlias::Hard => ResetDestinations {
+                move_ref: true,
+                index: true,
+                worktree: true,
+            },
+        }
+    }
+}
+
+/// Translate the mutually exclusive CLI destination flags into a destination
+/// set, rejecting ambiguous combinations.
+pub fn resolve_destinations(
+    move_ref: bool,
+    index: bool,
+    worktree: bool,
+    soft: bool,
+    mixed: bool,
+    hard: bool,
+) -> Result<(ResetDestinations, Option<ResetAlias>)> {
+    let alias_count = (soft as u8) + (mixed as u8) + (hard as u8);
+    let explicit_count = (move_ref as u8) + (index as u8) + (worktree as u8);
+
+    if alias_count > 1 {
+        bail!("Cannot combine multiple compatibility aliases (--soft, --mixed, --hard)");
+    }
+    if alias_count > 0 && explicit_count > 0 {
+        bail!(
+            "Cannot combine compatibility aliases (--soft, --mixed, --hard) with explicit flags \
+             (--move-ref, --index, --worktree)"
+        );
+    }
+
+    let alias = if soft {
+        Some(ResetAlias::Soft)
+    } else if mixed {
+        Some(ResetAlias::Mixed)
+    } else if hard {
+        Some(ResetAlias::Hard)
+    } else {
+        None
+    };
+
+    let destinations = alias.map(ResetAlias::destinations).unwrap_or(ResetDestinations {
+        move_ref,
+        index,
+        worktree,
+    });
+
+    Ok((destinations, alias))
+}
 
 /// Execute the `rusty reset` command according to the request.
 pub fn run_reset(repo: &Repository, request: &ResetRequest) -> Result<()> {
@@ -46,15 +135,12 @@ pub fn run_reset(repo: &Repository, request: &ResetRequest) -> Result<()> {
 
     validate_plan(&plan)?;
 
-    if plan.destinations.move_ref {
-        bail!(
-            "Ref movement is not enabled yet (Phase 4). \
-             Use '--dry-run' to inspect the planned ref update, or omit '--move-ref' \
-             and reset only the index and/or worktree."
-        );
-    }
+    // A full reset aborts an in-progress merge even when the index and worktree
+    // already match the target tree. Clearing the merge state is itself a
+    // mutation, so it must not be skipped by the no-op check.
+    let aborts_merge = plan.is_full_reset() && crate::merge::is_merge_in_progress(&repo.rusty_dir);
 
-    if !plan.has_mutations() {
+    if !plan.has_mutations() && !aborts_merge {
         println!("Nothing to do: the selected destinations already match the target.");
         return Ok(());
     }
@@ -75,29 +161,40 @@ pub fn run_reset(repo: &Repository, request: &ResetRequest) -> Result<()> {
 /// - In a non-interactive process (CI, pipes, tests), refuse without `--yes`
 ///   rather than blocking forever on stdin.
 fn confirm_execution(plan: &plan::ResetPlan, yes: bool) -> Result<()> {
-    if yes {
-        return Ok(());
-    }
+    let mut warnings = Vec::new();
 
     if plan_has_destructive_warnings(plan) {
-        eprintln!("Warning: locally modified tracked content will be overwritten:");
+        warnings.push("locally modified tracked content will be overwritten:".to_string());
         for conflict in plan.conflicts.iter().filter(|conflict| !conflict.fatal) {
             if let Some(path) = &conflict.path {
-                eprintln!("  - {}: {}", path, conflict.message);
+                warnings.push(format!("  - {}: {}", path, conflict.message));
             } else {
-                eprintln!("  - {}", conflict.message);
+                warnings.push(format!("  - {}", conflict.message));
             }
         }
     }
 
+    confirm_action(yes, "Proceed with this reset?", &warnings)
+}
+
+/// Shared confirmation helper for reset and recovery commands.
+pub(crate) fn confirm_action(yes: bool, prompt: &str, warnings: &[String]) -> Result<()> {
+    if yes {
+        return Ok(());
+    }
+
+    for warning in warnings {
+        eprintln!("Warning: {}", warning);
+    }
+
     if !io::stdin().is_terminal() {
         bail!(
-            "Refusing to execute reset without --yes in a non-interactive environment. \
+            "Refusing to execute without --yes in a non-interactive environment. \
              Use '--dry-run' to preview, or pass '--yes' to confirm."
         );
     }
 
-    print!("Proceed with this reset? [y/N] ");
+    print!("{} [y/N] ", prompt);
     io::stdout().flush().context("Failed to flush prompt")?;
 
     let mut answer = String::new();
@@ -107,7 +204,7 @@ fn confirm_execution(plan: &plan::ResetPlan, yes: bool) -> Result<()> {
 
     match answer.trim().to_ascii_lowercase().as_str() {
         "y" | "yes" => Ok(()),
-        _ => bail!("Reset cancelled; no files or index entries were changed."),
+        _ => bail!("Cancelled; no files or repository state were changed."),
     }
 }
 
@@ -157,5 +254,65 @@ mod tests {
             fatal: false,
         }]);
         assert!(plan_has_destructive_warnings(&plan));
+    }
+
+    #[test]
+    fn soft_alias_maps_to_ref_only() {
+        let (destinations, alias) =
+            resolve_destinations(false, false, false, true, false, false).unwrap();
+        assert_eq!(alias, Some(ResetAlias::Soft));
+        assert!(destinations.move_ref);
+        assert!(!destinations.index);
+        assert!(!destinations.worktree);
+        assert_eq!(alias.unwrap().git_equivalent(), "git reset --soft");
+    }
+
+    #[test]
+    fn mixed_alias_maps_to_ref_and_index() {
+        let (destinations, alias) =
+            resolve_destinations(false, false, false, false, true, false).unwrap();
+        assert_eq!(alias, Some(ResetAlias::Mixed));
+        assert!(destinations.move_ref);
+        assert!(destinations.index);
+        assert!(!destinations.worktree);
+    }
+
+    #[test]
+    fn hard_alias_maps_to_every_destination() {
+        let (destinations, alias) =
+            resolve_destinations(false, false, false, false, false, true).unwrap();
+        assert_eq!(alias, Some(ResetAlias::Hard));
+        assert!(destinations.move_ref);
+        assert!(destinations.index);
+        assert!(destinations.worktree);
+    }
+
+    #[test]
+    fn explicit_flags_pass_through_without_alias() {
+        let (destinations, alias) =
+            resolve_destinations(false, true, true, false, false, false).unwrap();
+        assert_eq!(alias, None);
+        assert!(!destinations.move_ref);
+        assert!(destinations.index);
+        assert!(destinations.worktree);
+    }
+
+    #[test]
+    fn multiple_aliases_are_rejected() {
+        assert!(resolve_destinations(false, false, false, true, true, false).is_err());
+        assert!(resolve_destinations(false, false, false, false, true, true).is_err());
+    }
+
+    #[test]
+    fn alias_with_explicit_flag_is_rejected() {
+        assert!(resolve_destinations(true, false, false, true, false, false).is_err());
+        assert!(resolve_destinations(false, true, false, false, false, true).is_err());
+    }
+
+    #[test]
+    fn non_interactive_shared_confirmation_is_refused() {
+        let err = confirm_action(false, "Proceed?", &[]).unwrap_err();
+        assert!(err.to_string().contains("non-interactive"));
+        assert!(confirm_action(true, "Proceed?", &[]).is_ok());
     }
 }

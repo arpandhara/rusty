@@ -137,6 +137,29 @@ pub enum Commands {
         #[arg(last = true)]
         paths: Vec<String>,
     },
+    /// Inspect or undo repository state changed by a previous operation
+    Recover {
+        #[command(subcommand)]
+        command: RecoverCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RecoverCommands {
+    /// Inspect or restore the ref moved by the most recent completed reset
+    Reset {
+        /// Preview the recovery without changing the ref
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output the recovery preview in machine-readable JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// Confirm restoration without interactive prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

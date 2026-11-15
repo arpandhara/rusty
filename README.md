@@ -31,6 +31,7 @@ Whether you prefer the precision of a UNIX CLI or the visual workflow of a keybo
 - **Reference Tracking:** Branches stored as lightweight references under `.rusty/refs/heads/`.
 - **Atomic Checkout:** Safely unpacks commit tree hierarchies into working tree directories while pruning removed files.
 - **Detached & Attached HEAD Management:** Seamless branch switching with symbolic reference resolution.
+- **Transactional Reset & Recovery:** Ref movement (`--soft`/`--mixed`/`--hard`), journaled apply with rollback/roll-forward, `.rusty/refs/recover/last-reset` recovery pointer, and `rusty recover reset` for undoing the last ref-moving reset.
 
 ### 3-Way Merge & Conflict Resolution Engine
 - **Graph Ancestry Resolution:** Automatically searches parent lineages to find the Lowest Common Ancestor (LCA).
@@ -118,8 +119,12 @@ flowchart TD
 │   ├── blobs/                 # SHA-256 addressed file payloads
 │   ├── trees/                 # Serialized directory trees
 │   └── commits/               # Serialized commit manifests
+├── operations/                # Active journal and reversible backups
+├── ledger/
+│   └── operations.jsonl       # Append-only operation records
 └── refs/
     ├── heads/                 # Local branches (e.g., main, dev, feature)
+    ├── recover/               # Last-reset recovery pointer (last-reset)
     └── remotes/
         └── origin/            # Remote tracking branches (e.g., origin/main)
 ```
@@ -209,7 +214,69 @@ rusty merge <branch-name>
 rusty merge --abort
 ```
 
-### 4. Integrity & Database Diagnostics (`fsck`)
+### 4. Reset & Recovery
+
+Reset changes the working tree, staging index, and/or branch reference to match a target commit. Unlike `git reset`, Rusty requires explicit destinations and confirms before mutating state.
+
+#### Reset destinations
+
+```bash
+# Move branch ref only (index & worktree untouched) — equivalent to git reset --soft
+rusty reset --soft <commit>
+
+# Move branch ref and update the index — equivalent to git reset --mixed (default)
+rusty reset --mixed <commit>
+rusty reset <commit>
+
+# Move branch ref, index, and working tree — equivalent to git reset --hard
+rusty reset --hard <commit>
+```
+
+All three aliases accept `--target <commit>`, `--yes` (skip confirmation), `--dry-run` (preview only), and `--json` (machine-readable preview).
+
+#### Path-limited reset
+
+```bash
+# Reset only the staging index for specific paths
+rusty reset --index -- src/main.rs src/lib.rs
+
+# Reset only working tree files for specific paths
+rusty reset --worktree -- src/main.rs
+```
+
+Path filters are literal paths (not globs). `.` is rejected; unmatched paths are fatal errors.
+
+#### Recovering the last ref-moving reset
+
+After any reset that moves a branch ref or detached `HEAD`, Rusty writes `.rusty/refs/recover/last-reset`.
+
+```bash
+# Preview what recovery would restore (no mutation)
+rusty recover reset --dry-run
+
+# Machine-readable recovery preview
+rusty recover reset --json
+
+# Restore the ref to its pre-reset value (index & worktree untouched)
+rusty recover reset --yes
+```
+
+Recovery rules:
+- Restores **only the ref**; index and working tree are never changed after finalization.
+- Refuses if the ref has moved since the reset (newer history detected).
+- Refuses if `HEAD` changed shape (attached vs detached, or different branch).
+- Requires `--yes` in non-interactive environments; prompts `Restore the ref to its pre-reset value? [y/N]` in a terminal.
+
+#### Confirmation policy
+
+Mutating resets require explicit consent:
+- `--yes` bypasses the prompt.
+- In a terminal: `Proceed with this reset? [y/N]`
+- Non-interactive (CI, pipes, scripts): refused without `--yes`.
+
+Fatal conflicts (untracked file overwrite, unsafe paths, merge in progress for partial resets, unmatched path filters) block execution. Non-fatal warnings (discarding local tracked changes) are shown and require confirmation.
+
+### 5. Integrity & Database Diagnostics (`fsck`)
 
 ```bash
 # Verify integrity of all objects, connectivity, and references
@@ -231,7 +298,7 @@ rusty fsck --lost-found
 rusty fsck --json
 ```
 
-### 4. Authentication & Remote Management
+### 6. Authentication & Remote Management
 
 ```bash
 # Authenticate CLI with your VCS server account
@@ -338,6 +405,7 @@ cargo test -- --nocapture
 - **3-Way Conflict Engine:** Accurate resolution and classification of `BothModified`, `ModifyDelete`, `DeleteModify`, and `AddAdd`.
 - **Ancestor Discovery:** Lowest Common Ancestor (LCA) traversal across complex DAG histories.
 - **Merge State Serialization:** Validated `MERGE_STATE` round-trip storage and abort recovery.
+- **Reset & Recovery:** Ref movement for attached/detached HEAD, `refs/recover/last-reset` pointer, `rusty recover reset` restore, ledger idempotency, and crash rollback/roll-forward.
 - **CLI & TUI Sandboxing:** Verified against headless pseudo-terminals (`pty`) with zero ANSI leakage.
 
 ---

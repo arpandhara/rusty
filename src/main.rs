@@ -242,36 +242,21 @@ fn main() -> Result<()> {
             yes,
             paths,
         } => {
-            let alias_count = (soft as u8) + (mixed as u8) + (hard as u8);
-            let explicit_count = (move_ref as u8) + (index as u8) + (worktree as u8);
+            let (destinations, alias) =
+                reset::resolve_destinations(move_ref, index, worktree, soft, mixed, hard)?;
 
-            if alias_count > 1 {
-                anyhow::bail!("Cannot combine multiple compatibility aliases (--soft, --mixed, --hard)");
-            }
-            if alias_count > 0 && explicit_count > 0 {
-                anyhow::bail!(
-                    "Cannot combine compatibility aliases (--soft, --mixed, --hard) with explicit flags (--move-ref, --index, --worktree)"
+            if let Some(alias) = alias {
+                eprintln!(
+                    "Note: {} is a compatibility alias for {}.",
+                    alias.flag(),
+                    alias.git_equivalent()
                 );
             }
-
-            let (final_move_ref, final_index, final_worktree) = if soft {
-                (true, false, false)
-            } else if mixed {
-                (true, true, false)
-            } else if hard {
-                (true, true, true)
-            } else {
-                (move_ref, index, worktree)
-            };
 
             let repo = state::Repository::discover()?;
             let request = reset::ResetRequest {
                 target,
-                destinations: reset::ResetDestinations {
-                    move_ref: final_move_ref,
-                    index: final_index,
-                    worktree: final_worktree,
-                },
+                destinations,
                 paths,
                 dry_run,
                 json,
@@ -279,6 +264,22 @@ fn main() -> Result<()> {
             };
 
             reset::run_reset(&repo, &request)?;
+        }
+        Commands::Recover { command } => {
+            let repo = state::Repository::discover()?;
+
+            match command {
+                cli::RecoverCommands::Reset { dry_run, json, yes } => {
+                    reset::recover::run_recover_reset(
+                        &repo,
+                        &reset::recover::RecoverOptions {
+                            dry_run,
+                            json,
+                            yes,
+                        },
+                    )?;
+                }
+            }
         }
     }
 
