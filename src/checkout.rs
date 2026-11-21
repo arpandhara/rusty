@@ -1,13 +1,10 @@
-use anyhow::{Context, Result};
-use std::collections::BTreeMap;
+use anyhow::Result;
 use std::fs;
 use std::path::Path;
 
 use crate::commit::get_commit;
 use crate::index::Index;
 use crate::merge;
-use crate::objects;
-use crate::path_check::safe_join;
 use crate::tree::load_tree_files;
 
 pub fn checkout(repo_path: &Path, branch: &str) -> Result<()> {
@@ -77,13 +74,13 @@ pub fn checkout(repo_path: &Path, branch: &str) -> Result<()> {
     // 4. Make sure checkout will not destroy work
     // ------------------------------------------------------------
 
-    ensure_clean_working_tree(repo_path, &files)?;
+    crate::state::worktree::ensure_clean_working_tree(repo_path, &files)?;
 
     // ------------------------------------------------------------
     // 5. Restore target working tree
     // ------------------------------------------------------------
 
-    restore_working_tree(repo_path, &files)?;
+    crate::state::worktree::restore_working_tree(repo_path, &files)?;
 
     // ------------------------------------------------------------
     // 6. Rebuild index
@@ -107,120 +104,6 @@ pub fn checkout(repo_path: &Path, branch: &str) -> Result<()> {
     )?;
 
     println!("Switched to branch '{}'", branch);
-
-    Ok(())
-}
-
-// ============================================================
-// CHECK FOR UNCOMMITTED / UNSAFE CHANGES
-// ============================================================
-
-fn ensure_clean_working_tree(
-    repo_path: &Path,
-    target_files: &BTreeMap<String, String>,
-) -> Result<()> {
-    let repo_root = repo_path
-        .parent()
-        .context("Invalid repository path")?
-        .canonicalize()?;
-
-    let index = Index::load(repo_path)?;
-
-    // ------------------------------------------------------------
-    // Check tracked files for modifications
-    // ------------------------------------------------------------
-
-    for (path, entry) in &index.entries {
-        let file_path = repo_root.join(path);
-
-        if !file_path.exists() {
-            anyhow::bail!(
-                "Cannot checkout: local changes would be lost (deleted '{}')",
-                path
-            );
-        }
-
-        if file_path.is_file() {
-            let current_hash = objects::hash_file(&file_path)?;
-
-            if current_hash != entry.blob_hash {
-                anyhow::bail!(
-                    "Cannot checkout: local changes would be overwritten in '{}'",
-                    path
-                );
-            }
-        }
-    }
-
-    // ------------------------------------------------------------
-    // Check untracked files that target branch would overwrite
-    // ------------------------------------------------------------
-
-    for target_path in target_files.keys() {
-        let file_path = repo_root.join(target_path);
-
-        if file_path.exists() && !index.contains(target_path) {
-            anyhow::bail!(
-                "Cannot checkout: untracked file '{}' would be overwritten",
-                target_path
-            );
-        }
-    }
-
-    Ok(())
-}
-
-// ============================================================
-// RESTORE WORKING TREE
-// ============================================================
-
-fn restore_working_tree(repo_path: &Path, files: &BTreeMap<String, String>) -> Result<()> {
-    let repo_root = repo_path
-        .parent()
-        .context("Invalid repository path")?
-        .canonicalize()?;
-
-    // Load the current index so we know which files
-    // are currently tracked.
-    let current_index = Index::load(repo_path)?;
-
-    // ------------------------------------------------------------
-    // 1. Remove tracked files that do not exist
-    //    in the target commit
-    // ------------------------------------------------------------
-
-    for path in current_index.entries.keys() {
-        if !files.contains_key(path) {
-            let file_path = safe_join(&repo_root, path)?;
-
-            if file_path.exists() {
-                fs::remove_file(&file_path)?;
-                println!("  - {}", path);
-            }
-        }
-    }
-
-    // ------------------------------------------------------------
-    // 2. Restore files from target commit
-    // ------------------------------------------------------------
-
-    for (path, blob_hash) in files {
-        let file_path = safe_join(&repo_root, path)?;
-
-        if let Some(parent) = file_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        let blob_path = repo_path.join("objects").join("blobs").join(blob_hash);
-
-        if !blob_path.exists() {
-            anyhow::bail!("Missing blob object {}", blob_hash);
-        }
-
-        let data = fs::read(&blob_path)?;
-
-        fs::write(&file_path, data)?;
-    }
 
     Ok(())
 }

@@ -92,6 +92,74 @@ pub enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Reset current HEAD, staging index, and/or working tree safely and explicitly
+    Reset {
+        /// Target commit, branch, or revision (e.g. HEAD, HEAD^, HEAD~2, main). Defaults to HEAD.
+        target: Option<String>,
+
+        /// Move the current branch reference (or HEAD if detached) to target commit
+        #[arg(long)]
+        move_ref: bool,
+
+        /// Update the staging index to match the target tree
+        #[arg(long)]
+        index: bool,
+
+        /// Update the working tree files to match the target blobs
+        #[arg(long)]
+        worktree: bool,
+
+        /// Compatibility alias: equivalent to --move-ref
+        #[arg(long)]
+        soft: bool,
+
+        /// Compatibility alias: equivalent to --move-ref --index
+        #[arg(long)]
+        mixed: bool,
+
+        /// Compatibility alias: equivalent to --move-ref --index --worktree
+        #[arg(long)]
+        hard: bool,
+
+        /// Preview planned changes and safety checks without mutating state
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output the plan in machine-readable JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// Confirm execution without interactive prompt
+        #[arg(short, long)]
+        yes: bool,
+
+        /// Optional paths to limit index and/or worktree updates
+        #[arg(last = true)]
+        paths: Vec<String>,
+    },
+    /// Inspect or undo repository state changed by a previous operation
+    Recover {
+        #[command(subcommand)]
+        command: RecoverCommands,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum RecoverCommands {
+    /// Inspect or restore the ref moved by the most recent completed reset
+    Reset {
+        /// Preview the recovery without changing the ref
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Output the recovery preview in machine-readable JSON format
+        #[arg(long)]
+        json: bool,
+
+        /// Confirm restoration without interactive prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

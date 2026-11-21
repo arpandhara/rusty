@@ -9,7 +9,7 @@ pub struct IndexEntry {
     pub blob_hash: String,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Index {
     pub entries: BTreeMap<String, IndexEntry>,
 }
@@ -38,13 +38,7 @@ impl Index {
     }
 
     pub fn save(&self, repo_path: &Path) -> Result<()> {
-        let index_path = repo_path.join("index");
-
-        let data = serde_json::to_string_pretty(self)?;
-
-        fs::write(index_path, data)?;
-
-        Ok(())
+        crate::state::index::save_index_atomic(self, repo_path)
     }
 
     pub fn add(&mut self, path: String, blob_hash: String) {

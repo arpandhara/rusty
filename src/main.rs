@@ -17,7 +17,9 @@ mod pull;
 mod push;
 mod remote;
 mod repository;
+mod reset;
 mod rm;
+mod state;
 mod status;
 mod tree;
 mod tui;
@@ -225,6 +227,58 @@ fn main() -> Result<()> {
             fsck::print_fsck_report(&report, &options);
             if !report.is_clean {
                 std::process::exit(1);
+            }
+        }
+        Commands::Reset {
+            target,
+            move_ref,
+            index,
+            worktree,
+            soft,
+            mixed,
+            hard,
+            dry_run,
+            json,
+            yes,
+            paths,
+        } => {
+            let (destinations, alias) =
+                reset::resolve_destinations(move_ref, index, worktree, soft, mixed, hard)?;
+
+            if let Some(alias) = alias {
+                eprintln!(
+                    "Note: {} is a compatibility alias for {}.",
+                    alias.flag(),
+                    alias.git_equivalent()
+                );
+            }
+
+            let repo = state::Repository::discover()?;
+            let request = reset::ResetRequest {
+                target,
+                destinations,
+                paths,
+                dry_run,
+                json,
+                yes,
+            };
+
+            reset::run_reset(&repo, &request)?;
+        }
+        Commands::Recover { command } => {
+            let repo = state::Repository::discover()?;
+
+            match command {
+                cli::RecoverCommands::Reset { dry_run, json, yes } => {
+                    reset::recover::run_recover_reset(
+                        &repo,
+                        &reset::recover::RecoverOptions {
+                            dry_run,
+                            json,
+                            yes,
+                        },
+                    )?;
+                }
             }
         }
     }
